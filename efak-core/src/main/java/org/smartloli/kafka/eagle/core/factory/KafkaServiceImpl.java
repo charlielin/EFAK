@@ -49,6 +49,7 @@ import org.smartloli.kafka.eagle.common.util.KConstants.BrokerSever;
 import org.smartloli.kafka.eagle.common.util.KConstants.CollectorType;
 import org.smartloli.kafka.eagle.common.util.KConstants.Kafka;
 import org.smartloli.kafka.eagle.core.sql.execute.KafkaConsumerAdapter;
+import org.smartloli.kafka.eagle.core.task.strategy.WorkNodeStrategy;
 import scala.Option;
 import scala.Tuple2;
 import scala.collection.JavaConversions;
@@ -383,7 +384,7 @@ public class KafkaServiceImpl implements KafkaService {
             object.put("mode", zkService.status(zk.split(":")[0], zk.split(":")[1]));
             targets.add(object);
         }
-        return targets.toJSONString();
+        return targets.toString();
     }
 
     /**
@@ -420,6 +421,7 @@ public class KafkaServiceImpl implements KafkaService {
      * @param replic     Replic numbers.
      * @return Map.
      */
+    @Override
     public Map<String, Object> create(String clusterAlias, String topicName, String partitions, String replic) {
         Map<String, Object> targets = new HashMap<String, Object>();
         List<BrokersInfo> brokerLists = BrokerCache.META_CACHE.get(clusterAlias);
@@ -673,7 +675,97 @@ public class KafkaServiceImpl implements KafkaService {
         } finally {
             adminClient.close();
         }
-        return consumerGroups.toJSONString();
+        return consumerGroups.toString();
+    }
+
+    /**
+     * Get kafka 0.10.x, 1.x, 2.x consumer metadata by distribute mode.
+     */
+    @Override
+    public String getDistributeKafkaConsumer(String clusterAlias) {
+        Properties prop = new Properties();
+        JSONArray consumerGroups = new JSONArray();
+        prop.put(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, parseBrokerServer(clusterAlias));
+
+        if (SystemConfigUtils.getBooleanProperty(clusterAlias + ".efak.sasl.enable")) {
+            sasl(prop, clusterAlias);
+        }
+        if (SystemConfigUtils.getBooleanProperty(clusterAlias + ".efak.ssl.enable")) {
+            ssl(prop, clusterAlias);
+        }
+
+        List<String> hosts = WorkUtils.getWorkNodes();
+        int port = SystemConfigUtils.getIntProperty("efak.worknode.port");
+        List<WorkNodeStrategy> nodes = new ArrayList<>();
+        for (String host : hosts) {
+            if (NetUtils.telnet(host, port)) {
+                WorkNodeStrategy wns = new WorkNodeStrategy();
+                wns.setPort(port);
+                wns.setHost(host);
+                String masterHost = SystemConfigUtils.getProperty("efak.worknode.master.host");
+                if (!masterHost.equals(host)) {
+                    nodes.add(wns);
+                }
+            }
+        }
+
+        AdminClient adminClient = null;
+        try {
+            adminClient = AdminClient.create(prop);
+            ListConsumerGroupsResult cgrs = adminClient.listConsumerGroups();
+            java.util.Iterator<ConsumerGroupListing> itor = cgrs.all().get().iterator();
+            int nodeIndex = 0;
+            String[] cgroups = SystemConfigUtils.getPropertyArray("efak.worknode.disable.cgroup", ",");
+            while (itor.hasNext()) {
+                ConsumerGroupListing gs = itor.next();
+                JSONObject consumerGroup = new JSONObject();
+                String groupId = gs.groupId();
+                DescribeConsumerGroupsResult descConsumerGroup = adminClient.describeConsumerGroups(Arrays.asList(groupId));
+                boolean status = true;
+                if (cgroups != null) {
+                    for (String cgroup : cgroups) {
+                        if (groupId != null) {
+                            if (groupId.equals(cgroup)) {
+                                status = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!groupId.contains("efak") && status) {
+                    consumerGroup.put("group", groupId);
+                    try {
+                        Node node = descConsumerGroup.all().get().get(groupId).coordinator();
+                        consumerGroup.put("node", node.host() + ":" + node.port());
+                    } catch (Exception e) {
+                        LOG.error("Get coordinator node has error, msg is " + e.getMessage());
+                        e.printStackTrace();
+                    }
+                    try {
+                        if (nodes.size() > 0) {
+                            consumerGroup.put("host", nodes.get(nodeIndex).getHost());
+                            nodeIndex++;
+                            if (nodeIndex == nodes.size() - 1) {
+                                // reset index
+                                nodeIndex = 0;
+                            }
+                        }
+
+                    } catch (Exception e) {
+                        LOG.error("Get shard node host has error, msg is ", e);
+                        e.printStackTrace();
+                    }
+                    consumerGroup.put("meta", getKafkaMetadata(parseBrokerServer(clusterAlias), groupId, clusterAlias));
+                    consumerGroups.add(consumerGroup);
+                }
+            }
+        } catch (Exception e) {
+            LOG.error("Get kafka consumer has error,msg is " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            adminClient.close();
+        }
+        return consumerGroups.toString();
     }
 
     /**
@@ -759,7 +851,7 @@ public class KafkaServiceImpl implements KafkaService {
         } finally {
             adminClient.close();
         }
-        return consumerGroups.toJSONString();
+        return consumerGroups.toString();
     }
 
     /**
@@ -879,7 +971,7 @@ public class KafkaServiceImpl implements KafkaService {
         JSONObject activerAndTopics = new JSONObject();
         activerAndTopics.put("activers", activerCounter);
         activerAndTopics.put("topics", topics.size());
-        return activerAndTopics.toJSONString();
+        return activerAndTopics.toString();
     }
 
     /**
@@ -906,7 +998,7 @@ public class KafkaServiceImpl implements KafkaService {
     }
 
     /**
-     * Get kafka 0.10.x, 1.x, 2.x consumer groups.
+     * Get kafka 0.10.x, 1.x, 2.x, 3.x consumer groups.
      */
     public int getKafkaConsumerGroups(String clusterAlias) {
         Properties prop = new Properties();
@@ -960,7 +1052,7 @@ public class KafkaServiceImpl implements KafkaService {
      * Get kafka 0.10.x consumer group and topic.
      */
     public String getKafkaConsumerGroupTopic(String clusterAlias, String group) {
-        return getKafkaMetadata(parseBrokerServer(clusterAlias), group, clusterAlias).toJSONString();
+        return getKafkaMetadata(parseBrokerServer(clusterAlias), group, clusterAlias).toString();
     }
 
     /**
@@ -1003,7 +1095,7 @@ public class KafkaServiceImpl implements KafkaService {
         } finally {
             adminClient.close();
         }
-        return targets.toJSONString();
+        return targets.toString();
     }
 
     /**
@@ -1403,7 +1495,7 @@ public class KafkaServiceImpl implements KafkaService {
     public String getUsedCpu(String clusterAlias, String host, int port) {
         JMXConnector connector = null;
         String JMX = SystemConfigUtils.getProperty(clusterAlias + ".efak.jmx.uri");
-        String cpu = "<span class='badge badge-danger'>NULL</span>";
+        String cpu = "<span class='badge bg-light-danger text-danger'>NULL</span>";
         try {
             JMXServiceURL jmxSeriverUrl = new JMXServiceURL(String.format(JMX, host + ":" + port));
             connector = JMXFactoryUtils.connectWithTimeout(clusterAlias, jmxSeriverUrl, 30, TimeUnit.SECONDS);
@@ -1412,11 +1504,11 @@ public class KafkaServiceImpl implements KafkaService {
             double cpuValue = Double.parseDouble(value);
             String percent = StrUtils.numberic((cpuValue * 100.0) + "") + "%";
             if ((cpuValue * 100.0) < BrokerSever.CPU_NORMAL) {
-                cpu = "<span class='badge badge-success'>" + percent + "</span>";
+                cpu = "<span class='badge bg-light-success text-success'>" + percent + "</span>";
             } else if ((cpuValue * 100.0) >= BrokerSever.CPU_NORMAL && (cpuValue * 100.0) < BrokerSever.CPU_DANGER) {
-                cpu = "<span class='badge badge-warning'>" + percent + "</span>";
+                cpu = "<span class='badge bg-light-warning text-warning'>" + percent + "</span>";
             } else if ((cpuValue * 100.0) >= BrokerSever.CPU_DANGER) {
-                cpu = "<span class='badge badge-danger'>" + percent + "</span>";
+                cpu = "<span class='badge bg-light-danger text-danger'>" + percent + "</span>";
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -1468,7 +1560,7 @@ public class KafkaServiceImpl implements KafkaService {
     public String getUsedMemory(String clusterAlias, String host, int port) {
         JMXConnector connector = null;
         String JMX = SystemConfigUtils.getProperty(clusterAlias + ".efak.jmx.uri");
-        String memory = "<span class='badge badge-danger'>NULL</span>";
+        String memory = "<span class='badge bg-light-danger text-danger'>NULL</span>";
         try {
             JMXServiceURL jmxSeriverUrl = new JMXServiceURL(String.format(JMX, host + ":" + port));
             connector = JMXFactoryUtils.connectWithTimeout(clusterAlias, jmxSeriverUrl, 30, TimeUnit.SECONDS);
@@ -1478,11 +1570,11 @@ public class KafkaServiceImpl implements KafkaService {
             long max = memBean.getHeapMemoryUsage().getMax();
             String percent = StrUtils.stringify(used) + " (" + StrUtils.numberic((used * 100.0 / max) + "") + "%)";
             if ((used * 100.0) / max < BrokerSever.MEM_NORMAL) {
-                memory = "<span class='badge badge-success'>" + percent + "</span>";
+                memory = "<span class='badge bg-light-success text-success'>" + percent + "</span>";
             } else if ((used * 100.0) / max >= BrokerSever.MEM_NORMAL && (used * 100.0) / max < BrokerSever.MEM_DANGER) {
-                memory = "<span class='badge badge-warning'>" + percent + "</span>";
+                memory = "<span class='badge bg-light-warning text-warning'>" + percent + "</span>";
             } else if ((used * 100.0) / max >= BrokerSever.MEM_DANGER) {
-                memory = "<span class='badge badge-danger'>" + percent + "</span>";
+                memory = "<span class='badge badge-danger text-danger'>" + percent + "</span>";
             }
         } catch (Exception e) {
             e.printStackTrace();
